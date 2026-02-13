@@ -1,90 +1,176 @@
-# OpenVPN Telemetry Installer (Non‑Blocking) – Ubuntu
+# OpenVPN Telemetry Agent Installer (Non-Blocking)
 
-This repository provides a **single setup script** that installs a **non-blocking** telemetry pipeline for an OpenVPN server.
+This repository provides one installer script:
 
-The design goal is critical:
+- `OpenVPN-Telemetry-Agent-Installer.sh`
 
-> **Telemetry must never break VPN authentication or client connectivity.**  
-> If the telemetry server is unreachable, OpenVPN users should still connect and work normally.
+It deploys a telemetry pipeline for OpenVPN where telemetry failures never block VPN client connections.
 
----
+## Design Goal
 
-## What this setup installs
+Telemetry must never break VPN authentication or client connectivity.
 
-Running `setup_openvpn_telemetry.sh` installs:
+How this is enforced:
 
-### 1) Local queue (spool)
-- **Queue file:** `/var/spool/openvpn-telemetry/queue.log`
-- **Pending chunks:** `/var/spool/openvpn-telemetry/pending/`
-- **Sequence counter:** `/var/spool/openvpn-telemetry/seq`
+- OpenVPN hooks only append events locally.
+- Hooks always exit `0`.
+- Network delivery is done asynchronously by a background systemd service.
 
-OpenVPN hook scripts append events into the queue as **NDJSON** (one JSON object per line).
+## Supported Platforms
 
-### 2) OpenVPN hook scripts (connect/disconnect)
-- `/etc/openvpn/scripts/telemetry-connect.sh`
-- `/etc/openvpn/scripts/telemetry-disconnect.sh`
+The installer supports package installation via:
 
-These hooks:
-- **only write locally**
-- **do not call the external telemetry server**
-- **always exit `0`** (never block OpenVPN)
+- `apt` (Ubuntu/Debian)
+- `dnf` (RHEL/Fedora family)
+- `yum` (CentOS 7)
 
-Ownership/permissions are tuned for common OpenVPN deployments where scripts run as:
-- `nobody:nogroup` (Ubuntu typical) or optionally `nobody:nobody`
+Your CentOS 7 profile is supported:
 
-### 3) Event writer helper
-- `/usr/local/sbin/openvpn-telemetry-write-event`
+- `ID="centos"`
+- `VERSION_ID="7"`
 
-This helper builds the event JSON from OpenVPN environment variables (e.g. `common_name`, `trusted_ip`, etc.) and appends it to the queue.
+## What Gets Installed
 
-### 4) Telemetry agent (systemd service)
+### Files and paths
+
+- Optional env overrides: `/etc/openvpn-telemetry/.env`
+- Generated env template: `/etc/openvpn-telemetry/.env.example`
+- Generated runtime config: `/etc/openvpn-telemetry/agent.env`
+- Writer binary: `/usr/local/sbin/openvpn-telemetry-write-event`
 - Agent binary: `/usr/local/sbin/openvpn-telemetry-agent`
+- OpenVPN connect hook: `/etc/openvpn/scripts/telemetry-connect.sh`
+- OpenVPN disconnect hook: `/etc/openvpn/scripts/telemetry-disconnect.sh`
 - systemd unit: `/etc/systemd/system/openvpn-telemetry-agent.service`
-- Config: `/etc/openvpn-telemetry/agent.env`
+- Queue file: `/var/spool/openvpn-telemetry/queue.log`
+- Pending chunks: `/var/spool/openvpn-telemetry/pending/`
+- Sequence counter: `/var/spool/openvpn-telemetry/seq`
+- Writer lock: `/var/spool/openvpn-telemetry/writer.lock`
 
-The agent:
-- rotates the queue file into **chunk files**
-- sends chunk batches to your external telemetry server via **HTTPS POST**
-- deletes chunks **only after successful delivery**
-- retries automatically if the server is down
+### Runtime behavior
 
----
+- Hooks write NDJSON events to `queue.log`.
+- Agent rotates queue into chunks.
+- Agent posts batches to `TELEMETRY_URL` over HTTPS.
+- Chunks are deleted only after successful delivery.
+- On failure, chunks are retried.
 
-## Why this is “non-blocking” (safe for VPN)
+## Required Configuration
 
-OpenVPN can reject or delay client connections if a `client-connect` script:
-- hangs
-- runs long network calls
-- exits non-zero
+`TELEMETRY_URL` is required.
 
-This setup avoids that completely:
+Create `/etc/openvpn-telemetry/.env` before running installer:
 
-✅ **Connect/disconnect scripts never perform network calls**  
-✅ **They always exit 0**  
-✅ **All network delivery happens asynchronously in the agent**  
+```bash
+sudo mkdir -p /etc/openvpn-telemetry
+sudo tee /etc/openvpn-telemetry/.env >/dev/null <<'EOF'
+TELEMETRY_URL="https://telemetry.example.com/api/v1/events"
 
-So VPN continues normally even during telemetry outages.
+# Optional
+# SERVER_ID="vpn-centos7-01"
+# OPENVPN_SCRIPT_USER="nobody"
+# OPENVPN_SCRIPT_GROUP="nobody"
+# OPENVPN_SERVER_CONF="/etc/openvpn/server/server.conf"
 
----
+# Rotation and retry
+# ROTATE_INTERVAL_SECONDS=5
+# ROTATE_MAX_BYTES=131072
+# RETRY_SLEEP_SECONDS=2
+# MAX_PENDING_FILES=5000
 
-## Minimum packages / dependencies
+# Auth option A
+# AUTH_HEADER="Authorization: Bearer YOURTOKEN"
 
-The installer uses only:
-- `bash`
-- `curl`
-- `flock` (from `util-linux`)
+# Auth option B (mTLS)
+# MTLS_ENABLED=1
+# CLIENT_CERT="/etc/openvpn-telemetry/client.crt"
+# CLIENT_KEY="/etc/openvpn-telemetry/client.key"
+# CA_CERT="/etc/openvpn-telemetry/ca.crt"
+EOF
+```
 
-If `curl` or `flock` are missing, the script installs them via `apt`.
+If `.env` does not exist, installer will generate `.env.example` and exit until `TELEMETRY_URL` is provided.
 
----
+## Installation
 
-## Telemetry payload format
+Run:
 
-The queue file uses **NDJSON** (one JSON object per line). The agent posts batches like:
+```bash
+sudo bash OpenVPN-Telemetry-Agent-Installer.sh
+```
+
+Installer actions:
+
+- installs missing dependencies (`curl`, `util-linux` for `flock`)
+- writes config and spool permissions
+- installs writer and agent
+- installs hooks
+- installs and starts systemd service
+- optionally patches OpenVPN config if `OPENVPN_SERVER_CONF` is set
+
+## OpenVPN Config
+
+If `OPENVPN_SERVER_CONF` is not set, add manually to your OpenVPN server config:
+
+```conf
+script-security 2
+client-connect /etc/openvpn/scripts/telemetry-connect.sh
+client-disconnect /etc/openvpn/scripts/telemetry-disconnect.sh
+```
+
+Then restart OpenVPN.
+
+Common paths:
+
+- `/etc/openvpn/server/server.conf`
+- `/etc/openvpn/server.conf`
+
+Common services:
+
+- `openvpn-server@server` (newer layouts)
+- `openvpn@server` (older layouts)
+
+## CentOS 7 Notes
+
+For CentOS 7 with OpenVPN running hooks as `nobody:nobody`, set:
+
+```bash
+OPENVPN_SCRIPT_USER="nobody"
+OPENVPN_SCRIPT_GROUP="nobody"
+```
+
+If SELinux is enforcing and blocks hook or spool access, review audit logs and apply appropriate policy adjustments.
+
+## Validation
+
+Check service status:
+
+```bash
+systemctl status openvpn-telemetry-agent --no-pager
+```
+
+Follow logs:
+
+```bash
+journalctl -u openvpn-telemetry-agent -f
+```
+
+Simulate one event:
+
+```bash
+sudo -u nobody \
+  common_name=testuser trusted_ip=1.2.3.4 trusted_port=5555 ifconfig_pool_remote_ip=10.8.0.99 \
+  /usr/local/sbin/openvpn-telemetry-write-event SESSION_CONNECTED
+
+tail -n 3 /var/spool/openvpn-telemetry/queue.log
+```
+
+## Payload Shape
+
+Events are queued as NDJSON and sent in batch:
 
 ```json
 {
-  "server_id": "vpn-ubuntu-01",
+  "server_id": "vpn-node-01",
   "sent_at": "2026-02-13T12:10:10Z",
   "events": [
     {
@@ -101,240 +187,45 @@ The queue file uses **NDJSON** (one JSON object per line). The agent posts batch
 }
 ```
 
-**Recommendation (server-side):**
-- enforce **idempotency** using `event_id` as a unique key to ignore duplicates safely.
+Server-side recommendation:
 
----
-
-## Files created/managed by the installer
-
-### Config / env
-- Optional overrides: `/etc/openvpn-telemetry/.env`
-- Generated agent config: `/etc/openvpn-telemetry/agent.env`
-
-### Executables
-- `/usr/local/sbin/openvpn-telemetry-agent`
-- `/usr/local/sbin/openvpn-telemetry-write-event`
-
-### OpenVPN hooks
-- `/etc/openvpn/scripts/telemetry-connect.sh`
-- `/etc/openvpn/scripts/telemetry-disconnect.sh`
-
-### systemd
-- `/etc/systemd/system/openvpn-telemetry-agent.service`
-
-### Queue/spool
-- `/var/spool/openvpn-telemetry/queue.log`
-- `/var/spool/openvpn-telemetry/pending/`
-- `/var/spool/openvpn-telemetry/seq`
-
----
-
-## Installation
-
-### 1) (Optional) Create override env file
-
-Create `/etc/openvpn-telemetry/.env` **before** running the installer to override defaults:
-
-```bash
-sudo mkdir -p /etc/openvpn-telemetry
-sudo tee /etc/openvpn-telemetry/.env >/dev/null <<'ENV'
-TELEMETRY_URL="https://telemetry.example.com/api/v1/events"
-SERVER_ID="vpn-ubuntu-01"
-
-# If OpenVPN runs scripts under nobody:nobody (instead of nobody:nogroup)
-# OPENVPN_SCRIPT_USER="nobody"
-# OPENVPN_SCRIPT_GROUP="nobody"
-
-# If you want the installer to patch your OpenVPN server config automatically:
-# OPENVPN_SERVER_CONF="/etc/openvpn/server/server.conf"
-
-# Rotation / retry tuning
-ROTATE_INTERVAL_SECONDS=5
-ROTATE_MAX_BYTES=131072
-RETRY_SLEEP_SECONDS=2
-
-# Optional auth (choose one):
-# AUTH_HEADER="Authorization: Bearer YOURTOKEN"
-
-# Optional mTLS (recommended):
-# MTLS_ENABLED=1
-# CLIENT_CERT="/etc/openvpn-telemetry/client.crt"
-# CLIENT_KEY="/etc/openvpn-telemetry/client.key"
-# CA_CERT="/etc/openvpn-telemetry/ca.crt"
-ENV
-```
-
-### 2) Run the installer
-
-```bash
-sudo bash setup_openvpn_telemetry.sh
-```
-
-The script will:
-- install minimal dependencies if missing
-- write configs
-- create spool directory & permissions
-- install agent + writer
-- install OpenVPN hooks
-- install and start the systemd service
-
----
-
-## OpenVPN configuration changes
-
-If you **did not** set `OPENVPN_SERVER_CONF` in `.env`, you must add these lines to your OpenVPN server config manually:
-
-```conf
-script-security 2
-client-connect /etc/openvpn/scripts/telemetry-connect.sh
-client-disconnect /etc/openvpn/scripts/telemetry-disconnect.sh
-```
-
-Then restart OpenVPN.
-
-> Common config paths:
-> - `/etc/openvpn/server/server.conf`
-> - `/etc/openvpn/server.conf`
-> - systemd instances: `openvpn-server@server`
-
----
-
-## Service management
-
-Check agent status:
-
-```bash
-systemctl status openvpn-telemetry-agent --no-pager
-```
-
-Follow logs:
-
-```bash
-journalctl -u openvpn-telemetry-agent -f
-```
-
-Restart:
-
-```bash
-sudo systemctl restart openvpn-telemetry-agent
-```
-
----
-
-## Testing (without OpenVPN)
-
-You can simulate an OpenVPN connect event by setting the same environment variables OpenVPN provides:
-
-```bash
-sudo -u nobody \
-  common_name=testuser trusted_ip=1.2.3.4 trusted_port=5555 ifconfig_pool_remote_ip=10.8.0.99 \
-  /usr/local/sbin/openvpn-telemetry-write-event SESSION_CONNECTED
-
-tail -n 3 /var/spool/openvpn-telemetry/queue.log
-```
-
-If your script user is different (e.g., `nobody:nobody`), run as that user.
-
----
-
-## Permissions model (important)
-
-OpenVPN often runs with `user nobody` / `group nogroup`, causing hook scripts to execute as `nobody:nogroup`.
-
-This installer ensures:
-- `/var/spool/openvpn-telemetry` is **group-writable**
-- queue and pending directories are writable by the OpenVPN script group
-
-If your OpenVPN uses `nobody:nobody`, set in `.env`:
-
-```bash
-OPENVPN_SCRIPT_USER="nobody"
-OPENVPN_SCRIPT_GROUP="nobody"
-```
-
----
-
-## Operational notes & best practices
-
-### Time synchronization
-To keep timestamp differences minimal, ensure both systems run NTP:
-- On Ubuntu: `chrony` is recommended.
-
-### Backpressure / disk safety
-If the external telemetry server is down for a long time, chunk files will accumulate in:
-- `/var/spool/openvpn-telemetry/pending/`
-
-Tune:
-- `MAX_PENDING_FILES`
-- rotation settings
-
-…and monitor disk usage.
-
-### Idempotency
-Because retries can cause duplicates, make `event_id` unique on the telemetry server.
-
----
+- enforce idempotency using `event_id`.
 
 ## Troubleshooting
 
-### 1) Agent is running but nothing arrives
-- Check service logs:
-  ```bash
-  journalctl -u openvpn-telemetry-agent -n 200 --no-pager
-  ```
-- Verify URL is correct and reachable:
-  ```bash
-  curl -v https://telemetry.example.com/
-  ```
+Agent running but no delivery:
 
-### 2) Queue file is not writable
-- Confirm OpenVPN script user/group and spool permissions:
-  ```bash
-  ls -ld /var/spool/openvpn-telemetry /var/spool/openvpn-telemetry/pending
-  ls -l /var/spool/openvpn-telemetry/queue.log
-  ```
+```bash
+journalctl -u openvpn-telemetry-agent -n 200 --no-pager
+curl -v https://telemetry.example.com/
+```
 
-### 3) VPN connections fail after enabling hooks
-This should not happen with these scripts (they always exit 0), but if it does:
-- verify OpenVPN has:
-  ```conf
-  script-security 2
-  ```
-- check OpenVPN logs for script errors
-- ensure scripts are executable:
-  ```bash
-  ls -l /etc/openvpn/scripts/telemetry-*.sh
-  ```
+Queue permission issues:
 
----
+```bash
+ls -ld /var/spool/openvpn-telemetry /var/spool/openvpn-telemetry/pending
+ls -l /var/spool/openvpn-telemetry/queue.log /var/spool/openvpn-telemetry/seq
+```
 
-## Security options
+Hook execution issues:
 
-### Bearer token header
-Set:
+```bash
+ls -l /etc/openvpn/scripts/telemetry-*.sh
+```
+
+## Security Options
+
+Bearer token:
+
 ```bash
 AUTH_HEADER="Authorization: Bearer <token>"
 ```
 
-### mTLS (recommended)
-Set:
+mTLS:
+
 ```bash
 MTLS_ENABLED=1
 CLIENT_CERT="/etc/openvpn-telemetry/client.crt"
 CLIENT_KEY="/etc/openvpn-telemetry/client.key"
 CA_CERT="/etc/openvpn-telemetry/ca.crt"
 ```
-
----
-
-## What this does *not* include (yet)
-This installer only covers **connect/disconnect** events.
-
-Typical next additions:
-- parsing `/var/log/openvpn/status.log` to emit periodic `SESSION_UPDATE` (bytes in/out)
-- parsing Easy-RSA `index.txt` to track `valid/revoked/expired` status changes
-- reconciliation snapshots
-
-If you want, you can extend the same queue+agent pattern for those sources too.
-

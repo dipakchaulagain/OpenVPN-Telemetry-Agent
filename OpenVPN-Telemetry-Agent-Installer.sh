@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # setup_openvpn_telemetry.sh
 #
-# Non-blocking OpenVPN telemetry installer for Ubuntu:
+# Non-blocking OpenVPN telemetry installer for Ubuntu/Debian/CentOS/RHEL:
 # - OpenVPN client-connect/client-disconnect hooks append NDJSON events locally
 # - A small agent ships queued events to an external telemetry server over HTTPS
 # - If telemetry server is down, VPN still works (scripts always exit 0)
@@ -11,12 +11,13 @@
 #   sudo bash setup_openvpn_telemetry.sh
 #
 # Optional config:
-#   /etc/openvpn-telemetry/.env  (example at end of this script)
+#   /etc/openvpn-telemetry/.env
 
 set -euo pipefail
 
 # ---------- Paths ----------
 ENV_FILE="/etc/openvpn-telemetry/.env"
+ENV_EXAMPLE_FILE="/etc/openvpn-telemetry/.env.example"
 CONF_DIR="/etc/openvpn-telemetry"
 CONF_FILE="$CONF_DIR/agent.env"
 
@@ -33,6 +34,7 @@ SPOOL_DIR="/var/spool/openvpn-telemetry"
 QUEUE_FILE="$SPOOL_DIR/queue.log"
 PENDING_DIR="$SPOOL_DIR/pending"
 SEQ_FILE="$SPOOL_DIR/seq"
+LOCK_FILE="$SPOOL_DIR/writer.lock"
 
 # ---------- Helpers ----------
 need_root() {
@@ -41,19 +43,54 @@ need_root() {
     exit 1
   fi
 }
+
 log() { echo "[setup] $*"; }
+
+get_pkg_manager() {
+  if command -v apt-get >/dev/null 2>&1; then
+    echo "apt"
+  elif command -v dnf >/dev/null 2>&1; then
+    echo "dnf"
+  elif command -v yum >/dev/null 2>&1; then
+    echo "yum"
+  else
+    echo ""
+  fi
+}
+
+install_package() {
+  local pkg="$1"
+  local pm
+  pm="$(get_pkg_manager)"
+
+  case "$pm" in
+    apt)
+      DEBIAN_FRONTEND=noninteractive apt-get update -y
+      DEBIAN_FRONTEND=noninteractive apt-get install -y "$pkg"
+      ;;
+    dnf)
+      dnf install -y "$pkg"
+      ;;
+    yum)
+      yum install -y "$pkg"
+      ;;
+    *)
+      log "ERROR: No supported package manager found (apt, dnf, yum)."
+      exit 1
+      ;;
+  esac
+}
 
 ensure_min_deps() {
   # Minimal deps: curl, util-linux (flock)
   if ! command -v curl >/dev/null 2>&1; then
     log "curl not found -> installing curl"
-    apt-get update -y
-    apt-get install -y curl
+    install_package curl
   fi
+
   if ! command -v flock >/dev/null 2>&1; then
     log "flock not found -> installing util-linux"
-    apt-get update -y
-    apt-get install -y util-linux
+    install_package util-linux
   fi
 }
 
@@ -61,8 +98,6 @@ detect_openvpn_script_user_group() {
   # If OpenVPN is configured with user/group directives, you can set these in .env:
   #   OPENVPN_SCRIPT_USER=nobody
   #   OPENVPN_SCRIPT_GROUP=nogroup
-  #
-  # Otherwise, default to nobody:nogroup (Ubuntu typical).
   OPENVPN_SCRIPT_USER="${OPENVPN_SCRIPT_USER:-nobody}"
   OPENVPN_SCRIPT_GROUP="${OPENVPN_SCRIPT_GROUP:-nogroup}"
 
@@ -73,7 +108,7 @@ detect_openvpn_script_user_group() {
     fi
   fi
 
-  # Ensure user exists; if not, fallback to nobody (or create is not recommended here)
+  # Ensure user exists; if not, fallback to nobody.
   if ! id -u "$OPENVPN_SCRIPT_USER" >/dev/null 2>&1; then
     OPENVPN_SCRIPT_USER="nobody"
   fi
@@ -82,7 +117,6 @@ detect_openvpn_script_user_group() {
 }
 
 load_env_defaults() {
-  TELEMETRY_URL="${TELEMETRY_URL:-https://telemetry.example.com/api/v1/events}"
   SERVER_ID="${SERVER_ID:-$(hostname -f 2>/dev/null || hostname)}"
 
   ROTATE_INTERVAL_SECONDS="${ROTATE_INTERVAL_SECONDS:-5}"    # low latency
@@ -101,6 +135,45 @@ load_env_defaults() {
 
   # Optional autopatch of OpenVPN config:
   OPENVPN_SERVER_CONF="${OPENVPN_SERVER_CONF:-}"
+
+  # OpenVPN hook user/group overrides
+  OPENVPN_SCRIPT_USER="${OPENVPN_SCRIPT_USER:-nobody}"
+  OPENVPN_SCRIPT_GROUP="${OPENVPN_SCRIPT_GROUP:-nogroup}"
+}
+
+write_env_example() {
+  mkdir -p "$CONF_DIR"
+  cat >"$ENV_EXAMPLE_FILE" <<EOF
+# Required: telemetry ingestion endpoint
+TELEMETRY_URL="https://telemetry.your-domain.tld/api/v1/events"
+
+# Optional identity
+# SERVER_ID="vpn-node-01"
+
+# Optional: if OpenVPN hooks run as nobody:nobody
+# OPENVPN_SCRIPT_USER="nobody"
+# OPENVPN_SCRIPT_GROUP="nobody"
+
+# Optional auto-patch OpenVPN config
+# OPENVPN_SERVER_CONF="/etc/openvpn/server/server.conf"
+
+# Rotation & retry
+# ROTATE_INTERVAL_SECONDS=5
+# ROTATE_MAX_BYTES=131072
+# RETRY_SLEEP_SECONDS=2
+# MAX_PENDING_FILES=5000
+
+# Auth option A: HTTP header
+# AUTH_HEADER="Authorization: Bearer YOURTOKEN"
+
+# Auth option B: mTLS
+# MTLS_ENABLED=1
+# CLIENT_CERT="/etc/openvpn-telemetry/client.crt"
+# CLIENT_KEY="/etc/openvpn-telemetry/client.key"
+# CA_CERT="/etc/openvpn-telemetry/ca.crt"
+EOF
+  chmod 0640 "$ENV_EXAMPLE_FILE"
+  chown root:root "$ENV_EXAMPLE_FILE"
 }
 
 read_env_file_if_present() {
@@ -109,9 +182,18 @@ read_env_file_if_present() {
     # shellcheck disable=SC1090
     source "$ENV_FILE"
   else
-    log "No $ENV_FILE found (ok). Using defaults."
+    log "No $ENV_FILE found. Creating template: $ENV_EXAMPLE_FILE"
   fi
+
   load_env_defaults
+  write_env_example
+
+  TELEMETRY_URL="${TELEMETRY_URL:-}"
+  if [[ -z "$TELEMETRY_URL" ]]; then
+    log "ERROR: TELEMETRY_URL is required."
+    log "Set TELEMETRY_URL in $ENV_FILE (copy from $ENV_EXAMPLE_FILE)."
+    exit 1
+  fi
 }
 
 write_agent_conf() {
@@ -126,6 +208,7 @@ SERVER_ID="$SERVER_ID"
 QUEUE_FILE="$QUEUE_FILE"
 PENDING_DIR="$PENDING_DIR"
 SEQ_FILE="$SEQ_FILE"
+LOCK_FILE="$LOCK_FILE"
 
 ROTATE_INTERVAL_SECONDS=$ROTATE_INTERVAL_SECONDS
 ROTATE_MAX_BYTES=$ROTATE_MAX_BYTES
@@ -149,14 +232,17 @@ EOF
 
 setup_spool_permissions() {
   mkdir -p "$SPOOL_DIR" "$PENDING_DIR"
-  touch "$QUEUE_FILE" "$SEQ_FILE" || true
+  touch "$QUEUE_FILE" "$SEQ_FILE" "$LOCK_FILE" || true
 
-  # Critical: hooks may run as nobody:nogroup. So:
-  # - directory writable by group
-  # - queue writable by group
+  # Critical: hooks may run as nobody:nogroup.
   chown -R root:"$OPENVPN_SCRIPT_GROUP" "$SPOOL_DIR"
   chmod 0770 "$SPOOL_DIR" "$PENDING_DIR"
-  chmod 0660 "$QUEUE_FILE" "$SEQ_FILE" || true
+  chmod 0660 "$QUEUE_FILE" "$SEQ_FILE" "$LOCK_FILE" || true
+
+  if [[ ! -s "$SEQ_FILE" ]]; then
+    echo "0" >"$SEQ_FILE" || true
+    chmod 0660 "$SEQ_FILE" || true
+  fi
 
   log "Prepared spool with group write for ${OPENVPN_SCRIPT_GROUP}: $SPOOL_DIR"
 }
@@ -178,8 +264,8 @@ log() { echo "$(date -u +"%Y-%m-%dT%H:%M:%SZ") openvpn-telemetry-agent: $*" >&2;
 
 # Single instance lock
 LOCK_FD=200
-LOCK_FILE="/run/openvpn-telemetry-agent.lock"
-exec {LOCK_FD}>"$LOCK_FILE"
+AGENT_LOCK_FILE="/run/openvpn-telemetry-agent.lock"
+exec {LOCK_FD}>"$AGENT_LOCK_FILE"
 flock -n "$LOCK_FD" || { log "Agent already running"; exit 0; }
 
 LAST_ROTATE=0
@@ -231,8 +317,13 @@ post_file() {
     curl_args+=(--cert "$CLIENT_CERT" --key "$CLIENT_KEY" --cacert "$CA_CERT")
   fi
 
-  curl "${curl_args[@]}" -X POST "$TELEMETRY_URL" --data-binary @"$tmp" >/dev/null
+  if curl "${curl_args[@]}" -X POST "$TELEMETRY_URL" --data-binary @"$tmp" >/dev/null; then
+    rm -f "$tmp"
+    return 0
+  fi
+
   rm -f "$tmp"
+  return 1
 }
 
 send_pending() {
@@ -273,11 +364,17 @@ install_writer() {
 # Non-blocking event writer for OpenVPN hooks.
 # ALWAYS exits 0 to never block VPN authentication/connect.
 
-set -euo pipefail
+set -u
 
 CONF="/etc/openvpn-telemetry/agent.env"
-# shellcheck disable=SC1090
-source "$CONF"
+if [[ -r "$CONF" ]]; then
+  # shellcheck disable=SC1090
+  source "$CONF"
+fi
+
+QUEUE_FILE="${QUEUE_FILE:-/var/spool/openvpn-telemetry/queue.log}"
+SEQ_FILE="${SEQ_FILE:-/var/spool/openvpn-telemetry/seq}"
+LOCK_FILE="${LOCK_FILE:-/var/spool/openvpn-telemetry/writer.lock}"
 
 EVENT_TYPE="${1:-UNKNOWN}"
 
@@ -290,21 +387,43 @@ VIRT_IP="${ifconfig_pool_remote_ip:-}"
 EVENT_TIME="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
 EVENT_ID="$(cat /proc/sys/kernel/random/uuid 2>/dev/null || uuidgen 2>/dev/null || echo "$RANDOM-$RANDOM-$RANDOM")"
 
-SEQ="0"
-if [[ -r "$SEQ_FILE" ]]; then
-  SEQ="$(cat "$SEQ_FILE" 2>/dev/null || echo 0)"
-fi
-SEQ=$((SEQ + 1))
-echo "$SEQ" >"$SEQ_FILE" 2>/dev/null || true
+json_escape() {
+  local s="${1:-}"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  s="${s//$'\n'/\\n}"
+  s="${s//$'\r'/\\r}"
+  s="${s//$'\t'/\\t}"
+  printf '%s' "$s"
+}
 
-LINE='{"event_id":"'"$EVENT_ID"'","seq":'"$SEQ"',"type":"'"$EVENT_TYPE"'","common_name":"'"${CN//\"/\\\"}"'","real_ip":"'"$REAL_IP"'","real_port":"'"$REAL_PORT"'","virtual_ip":"'"$VIRT_IP"'","event_time_vpn":"'"$EVENT_TIME"'"}'
+append_event() {
+  local seq line
+  seq="0"
 
-# Append locally; never fail VPN if it breaks
-(
-  umask 007
-  echo "$LINE" >> "$QUEUE_FILE"
-) >/dev/null 2>&1 || true
+  # Non-blocking lock keeps hook fast and prevents seq corruption under concurrency.
+  if exec 9>"$LOCK_FILE" 2>/dev/null; then
+    if flock -w 0.05 9 2>/dev/null; then
+      if [[ -r "$SEQ_FILE" ]]; then
+        seq="$(cat "$SEQ_FILE" 2>/dev/null || echo 0)"
+      fi
+      case "$seq" in
+        ''|*[!0-9]*) seq=0 ;;
+      esac
+      seq=$((seq + 1))
+      echo "$seq" >"$SEQ_FILE" 2>/dev/null || true
+    fi
+  fi
 
+  line='{"event_id":"'"$(json_escape "$EVENT_ID")"'","seq":'"$seq"',"type":"'"$(json_escape "$EVENT_TYPE")"'","common_name":"'"$(json_escape "$CN")"'","real_ip":"'"$(json_escape "$REAL_IP")"'","real_port":"'"$(json_escape "$REAL_PORT")"'","virtual_ip":"'"$(json_escape "$VIRT_IP")"'","event_time_vpn":"'"$(json_escape "$EVENT_TIME")"'"}'
+
+  (
+    umask 007
+    echo "$line" >>"$QUEUE_FILE"
+  ) >/dev/null 2>&1 || true
+}
+
+append_event || true
 exit 0
 EOF
 
@@ -319,13 +438,13 @@ install_hooks() {
 
   cat >"$CONNECT_HOOK" <<EOF
 #!/usr/bin/env bash
-$WRITER_BIN SESSION_CONNECTED || true
+$WRITER_BIN SESSION_CONNECTED >/dev/null 2>&1 || true
 exit 0
 EOF
 
   cat >"$DISCONNECT_HOOK" <<EOF
 #!/usr/bin/env bash
-$WRITER_BIN SESSION_DISCONNECTED || true
+$WRITER_BIN SESSION_DISCONNECTED >/dev/null 2>&1 || true
 exit 0
 EOF
 
@@ -393,10 +512,13 @@ patch_openvpn_conf_if_requested() {
 print_summary() {
   cat <<EOF
 
-✅ OpenVPN telemetry installed (non-blocking).
+OpenVPN telemetry installed (non-blocking).
 
 Agent config:
   $CONF_FILE
+
+Environment template:
+  $ENV_EXAMPLE_FILE
 
 Queue/spool:
   $QUEUE_FILE
@@ -435,36 +557,3 @@ main() {
 }
 
 main
-
-# --------------------------------------------------------------------
-# OPTIONAL: Create /etc/openvpn-telemetry/.env BEFORE running (overrides defaults)
-#
-# Example:
-#
-# sudo mkdir -p /etc/openvpn-telemetry
-# sudo tee /etc/openvpn-telemetry/.env >/dev/null <<'ENV'
-# TELEMETRY_URL="https://telemetry.example.com/api/v1/events"
-# SERVER_ID="vpn-ubuntu-01"
-#
-# # If your OpenVPN hooks run as nobody:nobody instead of nobody:nogroup:
-# # OPENVPN_SCRIPT_USER="nobody"
-# # OPENVPN_SCRIPT_GROUP="nobody"
-#
-# # Auto-patch OpenVPN config (optional):
-# # OPENVPN_SERVER_CONF="/etc/openvpn/server/server.conf"
-#
-# # Rotation & retry
-# ROTATE_INTERVAL_SECONDS=5
-# ROTATE_MAX_BYTES=131072
-# RETRY_SLEEP_SECONDS=2
-#
-# # Auth option A: Bearer token
-# # AUTH_HEADER="Authorization: Bearer YOURTOKEN"
-#
-# # Auth option B: mTLS (recommended)
-# MTLS_ENABLED=1
-# CLIENT_CERT="/etc/openvpn-telemetry/client.crt"
-# CLIENT_KEY="/etc/openvpn-telemetry/client.key"
-# CA_CERT="/etc/openvpn-telemetry/ca.crt"
-# ENV
-# --------------------------------------------------------------------
