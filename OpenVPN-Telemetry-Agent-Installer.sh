@@ -35,6 +35,7 @@ QUEUE_FILE="$SPOOL_DIR/queue.log"
 PENDING_DIR="$SPOOL_DIR/pending"
 SEQ_FILE="$SPOOL_DIR/seq"
 LOCK_FILE="$SPOOL_DIR/writer.lock"
+VALID_USERS_REF_FILE="$SPOOL_DIR/valid-users.ref"
 
 # ---------- Helpers ----------
 need_root() {
@@ -139,6 +140,12 @@ load_env_defaults() {
   # OpenVPN hook user/group overrides
   OPENVPN_SCRIPT_USER="${OPENVPN_SCRIPT_USER:-nobody}"
   OPENVPN_SCRIPT_GROUP="${OPENVPN_SCRIPT_GROUP:-nogroup}"
+
+  # Periodic metadata scanners
+  OPENVPN_INDEX_FILE="${OPENVPN_INDEX_FILE:-/etc/openvpn/easy-rsa/pki/index.txt}"
+  OPENVPN_CCD_DIR="${OPENVPN_CCD_DIR:-/etc/openvpn/ccd}"
+  INDEX_SCAN_INTERVAL_SECONDS="${INDEX_SCAN_INTERVAL_SECONDS:-60}"
+  CCD_SCAN_INTERVAL_SECONDS="${CCD_SCAN_INTERVAL_SECONDS:-60}"
 }
 
 write_env_example() {
@@ -156,6 +163,12 @@ TELEMETRY_URL="https://telemetry.your-domain.tld/api/v1/events"
 
 # Optional auto-patch OpenVPN config
 # OPENVPN_SERVER_CONF="/etc/openvpn/server/server.conf"
+
+# Optional user and CCD scanners
+# OPENVPN_INDEX_FILE="/etc/openvpn/easy-rsa/pki/index.txt"
+# OPENVPN_CCD_DIR="/etc/openvpn/ccd"
+# INDEX_SCAN_INTERVAL_SECONDS=60
+# CCD_SCAN_INTERVAL_SECONDS=60
 
 # Rotation & retry
 # ROTATE_INTERVAL_SECONDS=5
@@ -209,12 +222,18 @@ QUEUE_FILE="$QUEUE_FILE"
 PENDING_DIR="$PENDING_DIR"
 SEQ_FILE="$SEQ_FILE"
 LOCK_FILE="$LOCK_FILE"
+VALID_USERS_REF_FILE="$VALID_USERS_REF_FILE"
 
 ROTATE_INTERVAL_SECONDS=$ROTATE_INTERVAL_SECONDS
 ROTATE_MAX_BYTES=$ROTATE_MAX_BYTES
 
 RETRY_SLEEP_SECONDS=$RETRY_SLEEP_SECONDS
 MAX_PENDING_FILES=$MAX_PENDING_FILES
+
+OPENVPN_INDEX_FILE="$OPENVPN_INDEX_FILE"
+OPENVPN_CCD_DIR="$OPENVPN_CCD_DIR"
+INDEX_SCAN_INTERVAL_SECONDS=$INDEX_SCAN_INTERVAL_SECONDS
+CCD_SCAN_INTERVAL_SECONDS=$CCD_SCAN_INTERVAL_SECONDS
 
 AUTH_HEADER="$AUTH_HEADER"
 
@@ -261,6 +280,28 @@ mkdir -p "$PENDING_DIR"
 touch "$QUEUE_FILE"
 
 log() { echo "$(date -u +"%Y-%m-%dT%H:%M:%SZ") openvpn-telemetry-agent: $*" >&2; }
+
+json_escape() {
+  local s="${1:-}"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  s="${s//$'\n'/\\n}"
+  s="${s//$'\r'/\\r}"
+  s="${s//$'\t'/\\t}"
+  printf '%s' "$s"
+}
+
+new_event_id() {
+  cat /proc/sys/kernel/random/uuid 2>/dev/null || uuidgen 2>/dev/null || echo "$RANDOM-$RANDOM-$RANDOM"
+}
+
+enqueue_json_line() {
+  local line="$1"
+  (
+    umask 007
+    echo "$line" >>"$QUEUE_FILE"
+  ) >/dev/null 2>&1 || true
+}
 
 # Single instance lock
 LOCK_FD=200
@@ -345,8 +386,198 @@ send_pending() {
   done < <(find "$PENDING_DIR" -maxdepth 1 -type f -name 'chunk.*.log' -printf '%T@ %p\n' | sort -n | awk '{print $2}')
 }
 
+emit_users_update_event() {
+  local cn="$1"
+  local status="$2"
+  local action="$3"
+  local expires_at_index="${4:-}"
+  local revoked_at_index="${5:-}"
+  local ts eid line
+
+  ts="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+  eid="$(new_event_id)"
+  line='{"event_id":"'"$(json_escape "$eid")"'","type":"USERS_UPDATE","common_name":"'"$(json_escape "$cn")"'","status":"'"$(json_escape "$status")"'","action":"'"$(json_escape "$action")"'","source":"index.txt","expires_at_index":"'"$(json_escape "$expires_at_index")"'","revoked_at_index":"'"$(json_escape "$revoked_at_index")"'","event_time_agent":"'"$(json_escape "$ts")"'"}'
+  enqueue_json_line "$line"
+}
+
+emit_users_update_initial_bulk_event() {
+  local users_file="$1"
+  local ts eid line users_json cn first
+
+  ts="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+  eid="$(new_event_id)"
+  users_json="["
+  first=1
+
+  while IFS= read -r cn; do
+    local exp
+    cn="${cn%%$'\t'*}"
+    exp="$(awk -F '\t' -v k="$cn" '$1==k { print $2; exit }' "$users_file")"
+    [[ -n "$cn" ]] || continue
+    if (( first == 0 )); then
+      users_json+=","
+    fi
+    users_json+='{"common_name":"'"$(json_escape "$cn")"'","status":"VALID","expires_at_index":"'"$(json_escape "$exp")"'"}'
+    first=0
+  done < <(cut -f1 "$users_file")
+
+  users_json+="]"
+  line='{"event_id":"'"$(json_escape "$eid")"'","type":"USERS_UPDATE","action":"INITIAL","source":"index.txt","event_time_agent":"'"$(json_escape "$ts")"'","users":'"$users_json"'}'
+  enqueue_json_line "$line"
+}
+
+emit_users_update_added_bulk_event() {
+  local added_cn_file="$1"
+  local valid_users_file="$2"
+  local ts eid line users_json cn exp first
+
+  ts="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+  eid="$(new_event_id)"
+  users_json="["
+  first=1
+
+  while IFS= read -r cn; do
+    [[ -n "$cn" ]] || continue
+    exp="$(awk -F '\t' -v k="$cn" '$1==k { print $2; exit }' "$valid_users_file")"
+    if (( first == 0 )); then
+      users_json+=","
+    fi
+    users_json+='{"common_name":"'"$(json_escape "$cn")"'","status":"VALID","expires_at_index":"'"$(json_escape "$exp")"'"}'
+    first=0
+  done <"$added_cn_file"
+
+  users_json+="]"
+  line='{"event_id":"'"$(json_escape "$eid")"'","type":"USERS_UPDATE","action":"ADDED","source":"index.txt","event_time_agent":"'"$(json_escape "$ts")"'","users":'"$users_json"'}'
+  enqueue_json_line "$line"
+}
+
+build_index_snapshots() {
+  local valid_out="$1"
+  local status_out="$2"
+  : >"$valid_out"
+  : >"$status_out"
+  [[ -r "$OPENVPN_INDEX_FILE" ]] || return 1
+
+  awk -F '\t' -v valid_out="$valid_out" -v status_out="$status_out" '
+    {
+      st = $1
+      exp = $2
+      rev = $3
+      dn = $NF
+      sub(/^.*\/CN=/, "", dn)
+      cn = dn
+      if (length(cn) == 0) {
+        next
+      }
+      status[cn] = st
+      expires[cn] = exp
+      revoked[cn] = rev
+    }
+    END {
+      for (cn in status) {
+        printf "%s\t%s\t%s\t%s\n", cn, status[cn], expires[cn], revoked[cn] >> status_out
+        if (status[cn] == "V") {
+          printf "%s\t%s\n", cn, expires[cn] >> valid_out
+        }
+      }
+    }
+  ' "$OPENVPN_INDEX_FILE"
+
+  sort -u -o "$valid_out" "$valid_out"
+  sort -u -o "$status_out" "$status_out"
+}
+
+scan_index_and_emit_user_updates() {
+  local cur_valid cur_status tmp_add tmp_rem prev_cn cur_cn cn exp st rev
+  cur_valid="$(mktemp)"
+  cur_status="$(mktemp)"
+  tmp_add="$(mktemp)"
+  tmp_rem="$(mktemp)"
+  prev_cn="$(mktemp)"
+  cur_cn="$(mktemp)"
+
+  if ! build_index_snapshots "$cur_valid" "$cur_status"; then
+    log "WARNING: index file unreadable: $OPENVPN_INDEX_FILE"
+    rm -f "$cur_valid" "$cur_status" "$tmp_add" "$tmp_rem" "$prev_cn" "$cur_cn"
+    return 1
+  fi
+
+  if [[ ! -f "$VALID_USERS_REF_FILE" ]]; then
+    cp "$cur_valid" "$VALID_USERS_REF_FILE" 2>/dev/null || true
+    emit_users_update_initial_bulk_event "$cur_valid"
+    log "Users reference initialized from index file."
+    rm -f "$cur_valid" "$cur_status" "$tmp_add" "$tmp_rem" "$prev_cn" "$cur_cn"
+    return 0
+  fi
+
+  cut -f1 "$VALID_USERS_REF_FILE" | sort -u >"$prev_cn"
+  cut -f1 "$cur_valid" | sort -u >"$cur_cn"
+
+  comm -13 "$prev_cn" "$cur_cn" >"$tmp_add" || true
+  if [[ -s "$tmp_add" ]]; then
+    emit_users_update_added_bulk_event "$tmp_add" "$cur_valid"
+  fi
+
+  comm -23 "$prev_cn" "$cur_cn" >"$tmp_rem" || true
+  while IFS= read -r cn; do
+    [[ -n "$cn" ]] || continue
+    st="$(awk -F '\t' -v k="$cn" '$1==k { print $2; exit }' "$cur_status")"
+    exp="$(awk -F '\t' -v k="$cn" '$1==k { print $3; exit }' "$cur_status")"
+    rev="$(awk -F '\t' -v k="$cn" '$1==k { print $4; exit }' "$cur_status")"
+
+    if [[ "$st" == "R" ]]; then
+      emit_users_update_event "$cn" "REVOKED" "REVOKED" "$exp" "$rev"
+    elif [[ "$st" == "E" ]]; then
+      emit_users_update_event "$cn" "EXPIRED" "EXPIRED" "$exp" ""
+    else
+      emit_users_update_event "$cn" "UNKNOWN" "REMOVED" "$exp" "$rev"
+    fi
+  done <"$tmp_rem"
+
+  cp "$cur_valid" "$VALID_USERS_REF_FILE" 2>/dev/null || true
+  rm -f "$cur_valid" "$cur_status" "$tmp_add" "$tmp_rem" "$prev_cn" "$cur_cn"
+}
+
+emit_ccd_info_event() {
+  local cn="$1"
+  local ccd_file="$2"
+  local content_b64 ts eid line
+
+  content_b64="$(base64 "$ccd_file" 2>/dev/null | tr -d '\n')"
+  ts="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+  eid="$(new_event_id)"
+  line='{"event_id":"'"$(json_escape "$eid")"'","type":"CCD_INFO","common_name":"'"$(json_escape "$cn")"'","ccd_path":"'"$(json_escape "$ccd_file")"'","ccd_content_b64":"'"$(json_escape "$content_b64")"'","event_time_agent":"'"$(json_escape "$ts")"'"}'
+  enqueue_json_line "$line"
+}
+
+scan_ccd_and_emit_info() {
+  local f cn
+  [[ -d "$OPENVPN_CCD_DIR" ]] || return 0
+  [[ -r "$VALID_USERS_REF_FILE" ]] || return 0
+
+  while IFS= read -r f; do
+    cn="$(basename "$f")"
+    [[ -n "$cn" ]] || continue
+    if awk -F '\t' -v k="$cn" '$1==k { found=1; exit } END { exit !found }' "$VALID_USERS_REF_FILE"; then
+      emit_ccd_info_event "$cn" "$f"
+    fi
+  done < <(find "$OPENVPN_CCD_DIR" -maxdepth 1 -type f | sort)
+}
+
 log "Started. url=$TELEMETRY_URL server_id=$SERVER_ID"
+LAST_INDEX_SCAN=0
+LAST_CCD_SCAN=0
 while true; do
+  now_epoch="$(date +%s)"
+  if (( now_epoch - LAST_INDEX_SCAN >= INDEX_SCAN_INTERVAL_SECONDS )); then
+    scan_index_and_emit_user_updates || true
+    LAST_INDEX_SCAN="$now_epoch"
+  fi
+  if (( now_epoch - LAST_CCD_SCAN >= CCD_SCAN_INTERVAL_SECONDS )); then
+    scan_ccd_and_emit_info || true
+    LAST_CCD_SCAN="$now_epoch"
+  fi
+
   rotate_queue_if_needed || true
   send_pending || sleep "$RETRY_SLEEP_SECONDS"
   sleep 1

@@ -49,6 +49,8 @@ Your CentOS 7 profile is supported:
 ### Runtime behavior
 
 - Hooks write NDJSON events to `queue.log`.
+- Agent periodically scans Easy-RSA index and emits `USERS_UPDATE` events.
+- Agent periodically scans CCD files and emits `CCD_INFO` events for valid users.
 - Agent rotates queue into chunks.
 - Agent posts batches to `TELEMETRY_URL` over HTTPS.
 - Chunks are deleted only after successful delivery.
@@ -70,6 +72,12 @@ TELEMETRY_URL="https://telemetry.example.com/api/v1/events"
 # OPENVPN_SCRIPT_USER="nobody"
 # OPENVPN_SCRIPT_GROUP="nobody"
 # OPENVPN_SERVER_CONF="/etc/openvpn/server/server.conf"
+
+# Optional user and CCD scanners
+# OPENVPN_INDEX_FILE="/etc/openvpn/easy-rsa/pki/index.txt"
+# OPENVPN_CCD_DIR="/etc/openvpn/ccd"
+# INDEX_SCAN_INTERVAL_SECONDS=60
+# CCD_SCAN_INTERVAL_SECONDS=60
 
 # Rotation and retry
 # ROTATE_INTERVAL_SECONDS=5
@@ -190,6 +198,112 @@ Events are queued as NDJSON and sent in batch:
 Server-side recommendation:
 
 - enforce idempotency using `event_id`.
+
+Event types emitted by this agent:
+
+- `SESSION_CONNECTED` from OpenVPN `client-connect` hook.
+- `SESSION_DISCONNECTED` from OpenVPN `client-disconnect` hook.
+- `USERS_UPDATE` from periodic Easy-RSA `index.txt` scans.
+- `CCD_INFO` from periodic CCD directory scans (for users currently valid in reference list).
+
+`USERS_UPDATE` example (periodic scan with newly added users, single bulk event):
+
+```json
+{
+  "event_id": "b0ca3d8f-3f81-41cb-8e23-18cdbed4f5bb",
+  "type": "USERS_UPDATE",
+  "action": "ADDED",
+  "source": "index.txt",
+  "event_time_agent": "2026-02-13T12:10:05Z",
+  "users": [
+    {
+      "common_name": "alice",
+      "status": "VALID",
+      "expires_at_index": "290124060904Z"
+    },
+    {
+      "common_name": "bob",
+      "status": "VALID",
+      "expires_at_index": "290124092711Z"
+    }
+  ]
+}
+```
+
+`USERS_UPDATE` example (first scan when reference list is created, single bulk event):
+
+```json
+{
+  "event_id": "2f6123ea-31dc-4f2d-8704-a79f30dd2a81",
+  "type": "USERS_UPDATE",
+  "action": "INITIAL",
+  "source": "index.txt",
+  "event_time_agent": "2026-02-13T12:00:00Z",
+  "users": [
+    {
+      "common_name": "alice",
+      "status": "VALID",
+      "expires_at_index": "290124060904Z"
+    },
+    {
+      "common_name": "bob",
+      "status": "VALID",
+      "expires_at_index": "290124092711Z"
+    }
+  ]
+}
+```
+
+`USERS_UPDATE` example (revoked user):
+
+```json
+{
+  "event_id": "85715f85-45f7-441a-b7d8-a74f2066f8f8",
+  "type": "USERS_UPDATE",
+  "common_name": "subarnaISPcsr",
+  "status": "REVOKED",
+  "action": "REVOKED",
+  "source": "index.txt",
+  "expires_at_index": "241016071755Z",
+  "revoked_at_index": "221206054507Z",
+  "event_time_agent": "2026-02-13T12:11:10Z"
+}
+```
+
+`USERS_UPDATE` example (expired user):
+
+```json
+{
+  "event_id": "9013f5a8-1d09-42ad-9a40-7fc4b51f8eb5",
+  "type": "USERS_UPDATE",
+  "common_name": "dineshButwalNOC",
+  "status": "EXPIRED",
+  "action": "EXPIRED",
+  "source": "index.txt",
+  "expires_at_index": "241012065432Z",
+  "revoked_at_index": "",
+  "event_time_agent": "2026-02-13T12:12:10Z"
+}
+```
+
+`CCD_INFO` example:
+
+```json
+{
+  "event_id": "0af8d2a7-6518-4aeb-b0d1-2ad6573a01d2",
+  "type": "CCD_INFO",
+  "common_name": "alice",
+  "ccd_path": "/etc/openvpn/ccd/alice",
+  "ccd_content_b64": "aWZjb25maWctcHVzaCAxMC44LjAuNiAyNTUuMjU1LjI1NS4w",
+  "event_time_agent": "2026-02-13T12:10:10Z"
+}
+```
+
+Important note about `ccd_content_b64`:
+
+- It is Base64-encoded content for transport in JSON.
+- It is not encrypted.
+- No salt or key is required to decode it on backend.
 
 ## Troubleshooting
 
