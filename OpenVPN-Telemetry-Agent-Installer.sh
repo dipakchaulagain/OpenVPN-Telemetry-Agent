@@ -392,34 +392,38 @@ emit_users_update_event() {
   local action="$3"
   local expires_at_index="${4:-}"
   local revoked_at_index="${5:-}"
-  local ts eid line
+  local ts eid line extras
 
   ts="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
   eid="$(new_event_id)"
-  line='{"event_id":"'"$(json_escape "$eid")"'","type":"USERS_UPDATE","common_name":"'"$(json_escape "$cn")"'","status":"'"$(json_escape "$status")"'","action":"'"$(json_escape "$action")"'","source":"index.txt","expires_at_index":"'"$(json_escape "$expires_at_index")"'","revoked_at_index":"'"$(json_escape "$revoked_at_index")"'","event_time_agent":"'"$(json_escape "$ts")"'"}'
+  extras=""
+  if [[ -n "$expires_at_index" ]]; then
+    extras+=',"expires_at_index":"'"$(json_escape "$expires_at_index")"'"'
+  fi
+  if [[ -n "$revoked_at_index" ]]; then
+    extras+=',"revoked_at_index":"'"$(json_escape "$revoked_at_index")"'"'
+  fi
+  line='{"event_id":"'"$(json_escape "$eid")"'","type":"USERS_UPDATE","common_name":"'"$(json_escape "$cn")"'","status":"'"$(json_escape "$status")"'","action":"'"$(json_escape "$action")"'"'"$extras"',"event_time_agent":"'"$(json_escape "$ts")"'"}'
   enqueue_json_line "$line"
 }
 
 emit_users_update_initial_bulk_event() {
   local users_file="$1"
-  local ts eid line users_json cn first
+  local ts eid line users_json cn st exp first
 
   ts="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
   eid="$(new_event_id)"
   users_json="["
   first=1
 
-  while IFS= read -r cn; do
-    local exp
-    cn="${cn%%$'\t'*}"
-    exp="$(awk -F '\t' -v k="$cn" '$1==k { print $2; exit }' "$users_file")"
+  while IFS=$'\t' read -r cn st exp; do
     [[ -n "$cn" ]] || continue
     if (( first == 0 )); then
       users_json+=","
     fi
-    users_json+='{"common_name":"'"$(json_escape "$cn")"'","status":"VALID","expires_at_index":"'"$(json_escape "$exp")"'"}'
+    users_json+='{"common_name":"'"$(json_escape "$cn")"'","status":"'"$(json_escape "$st")"'","expires_at_index":"'"$(json_escape "$exp")"'"}'
     first=0
-  done < <(cut -f1 "$users_file")
+  done <"$users_file"
 
   users_json+="]"
   line='{"event_id":"'"$(json_escape "$eid")"'","type":"USERS_UPDATE","action":"INITIAL","source":"index.txt","event_time_agent":"'"$(json_escape "$ts")"'","users":'"$users_json"'}'
@@ -454,8 +458,10 @@ emit_users_update_added_bulk_event() {
 build_index_snapshots() {
   local valid_out="$1"
   local status_out="$2"
+  local active_out="$3"
   : >"$valid_out"
   : >"$status_out"
+  : >"$active_out"
   [[ -r "$OPENVPN_INDEX_FILE" ]] || return 1
 
   awk -F '\t' -v valid_out="$valid_out" -v status_out="$status_out" '
@@ -478,6 +484,11 @@ build_index_snapshots() {
         printf "%s\t%s\t%s\t%s\n", cn, status[cn], expires[cn], revoked[cn] >> status_out
         if (status[cn] == "V") {
           printf "%s\t%s\n", cn, expires[cn] >> valid_out
+        } else if (status[cn] == "E") {
+          printf "%s\t%s\t%s\n", cn, status[cn], expires[cn] >> active_out
+        }
+        if (status[cn] == "V") {
+          printf "%s\t%s\t%s\n", cn, status[cn], expires[cn] >> active_out
         }
       }
     }
@@ -485,20 +496,22 @@ build_index_snapshots() {
 
   sort -u -o "$valid_out" "$valid_out"
   sort -u -o "$status_out" "$status_out"
+  sort -u -o "$active_out" "$active_out"
 }
 
 scan_index_and_emit_user_updates() {
-  local cur_valid cur_status tmp_add tmp_rem prev_cn cur_cn cn exp st rev
+  local cur_valid cur_status cur_active tmp_add tmp_rem prev_cn cur_cn cn exp st rev
   cur_valid="$(mktemp)"
   cur_status="$(mktemp)"
+  cur_active="$(mktemp)"
   tmp_add="$(mktemp)"
   tmp_rem="$(mktemp)"
   prev_cn="$(mktemp)"
   cur_cn="$(mktemp)"
 
-  if ! build_index_snapshots "$cur_valid" "$cur_status"; then
+  if ! build_index_snapshots "$cur_valid" "$cur_status" "$cur_active"; then
     log "WARNING: index file unreadable: $OPENVPN_INDEX_FILE"
-    rm -f "$cur_valid" "$cur_status" "$tmp_add" "$tmp_rem" "$prev_cn" "$cur_cn"
+    rm -f "$cur_valid" "$cur_status" "$cur_active" "$tmp_add" "$tmp_rem" "$prev_cn" "$cur_cn"
     return 1
   fi
 
@@ -506,7 +519,7 @@ scan_index_and_emit_user_updates() {
     cp "$cur_valid" "$VALID_USERS_REF_FILE" 2>/dev/null || true
     emit_users_update_initial_bulk_event "$cur_valid"
     log "Users reference initialized from index file."
-    rm -f "$cur_valid" "$cur_status" "$tmp_add" "$tmp_rem" "$prev_cn" "$cur_cn"
+    rm -f "$cur_valid" "$cur_status" "$cur_active" "$tmp_add" "$tmp_rem" "$prev_cn" "$cur_cn"
     return 0
   fi
 
@@ -526,7 +539,7 @@ scan_index_and_emit_user_updates() {
     rev="$(awk -F '\t' -v k="$cn" '$1==k { print $4; exit }' "$cur_status")"
 
     if [[ "$st" == "R" ]]; then
-      emit_users_update_event "$cn" "REVOKED" "REVOKED" "$exp" "$rev"
+      emit_users_update_event "$cn" "REVOKED" "REVOKED" "" "$rev"
     elif [[ "$st" == "E" ]]; then
       emit_users_update_event "$cn" "EXPIRED" "EXPIRED" "$exp" ""
     else
@@ -535,7 +548,7 @@ scan_index_and_emit_user_updates() {
   done <"$tmp_rem"
 
   cp "$cur_valid" "$VALID_USERS_REF_FILE" 2>/dev/null || true
-  rm -f "$cur_valid" "$cur_status" "$tmp_add" "$tmp_rem" "$prev_cn" "$cur_cn"
+  rm -f "$cur_valid" "$cur_status" "$cur_active" "$tmp_add" "$tmp_rem" "$prev_cn" "$cur_cn"
 }
 
 emit_ccd_info_event() {
@@ -612,7 +625,6 @@ EVENT_TYPE="${1:-UNKNOWN}"
 # OpenVPN exports these env vars to scripts:
 CN="${common_name:-unknown}"
 REAL_IP="${trusted_ip:-}"
-REAL_PORT="${trusted_port:-}"
 VIRT_IP="${ifconfig_pool_remote_ip:-}"
 
 EVENT_TIME="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
@@ -629,24 +641,16 @@ json_escape() {
 }
 
 append_event() {
-  local seq line
-  seq="0"
-
-  # Non-blocking lock keeps hook fast and prevents seq corruption under concurrency.
-  if exec 9>"$LOCK_FILE" 2>/dev/null; then
-    if flock -w 0.05 9 2>/dev/null; then
-      if [[ -r "$SEQ_FILE" ]]; then
-        seq="$(cat "$SEQ_FILE" 2>/dev/null || echo 0)"
-      fi
-      case "$seq" in
-        ''|*[!0-9]*) seq=0 ;;
-      esac
-      seq=$((seq + 1))
-      echo "$seq" >"$SEQ_FILE" 2>/dev/null || true
-    fi
+  local line extras
+  extras=""
+  if [[ -n "$REAL_IP" ]]; then
+    extras+=',"real_ip":"'"$(json_escape "$REAL_IP")"'"'
+  fi
+  if [[ -n "$VIRT_IP" ]]; then
+    extras+=',"virtual_ip":"'"$(json_escape "$VIRT_IP")"'"'
   fi
 
-  line='{"event_id":"'"$(json_escape "$EVENT_ID")"'","seq":'"$seq"',"type":"'"$(json_escape "$EVENT_TYPE")"'","common_name":"'"$(json_escape "$CN")"'","real_ip":"'"$(json_escape "$REAL_IP")"'","real_port":"'"$(json_escape "$REAL_PORT")"'","virtual_ip":"'"$(json_escape "$VIRT_IP")"'","event_time_vpn":"'"$(json_escape "$EVENT_TIME")"'"}'
+  line='{"event_id":"'"$(json_escape "$EVENT_ID")"'","type":"'"$(json_escape "$EVENT_TYPE")"'","common_name":"'"$(json_escape "$CN")"'","event_time_vpn":"'"$(json_escape "$EVENT_TIME")"'"'"$extras"'}'
 
   (
     umask 007

@@ -182,14 +182,18 @@ Events are queued as NDJSON and sent in batch:
   "sent_at": "2026-02-13T12:10:10Z",
   "events": [
     {
-      "event_id": "uuid",
-      "seq": 123,
+      "event_id": "uuid-1",
       "type": "SESSION_CONNECTED",
       "common_name": "alice",
       "real_ip": "1.2.3.4",
-      "real_port": "5555",
       "virtual_ip": "10.8.0.6",
       "event_time_vpn": "2026-02-13T12:10:05Z"
+    },
+    {
+      "event_id": "uuid-2",
+      "type": "SESSION_DISCONNECTED",
+      "common_name": "alice",
+      "event_time_vpn": "2026-02-13T12:20:05Z"
     }
   ]
 }
@@ -263,8 +267,6 @@ Event types emitted by this agent:
   "common_name": "subarnaISPcsr",
   "status": "REVOKED",
   "action": "REVOKED",
-  "source": "index.txt",
-  "expires_at_index": "241016071755Z",
   "revoked_at_index": "221206054507Z",
   "event_time_agent": "2026-02-13T12:11:10Z"
 }
@@ -279,9 +281,7 @@ Event types emitted by this agent:
   "common_name": "dineshButwalNOC",
   "status": "EXPIRED",
   "action": "EXPIRED",
-  "source": "index.txt",
   "expires_at_index": "241012065432Z",
-  "revoked_at_index": "",
   "event_time_agent": "2026-02-13T12:12:10Z"
 }
 ```
