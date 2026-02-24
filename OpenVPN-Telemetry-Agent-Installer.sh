@@ -36,6 +36,7 @@ PENDING_DIR="$SPOOL_DIR/pending"
 SEQ_FILE="$SPOOL_DIR/seq"
 LOCK_FILE="$SPOOL_DIR/writer.lock"
 VALID_USERS_REF_FILE="$SPOOL_DIR/valid-users.ref"
+CCD_STATE_DIR="$SPOOL_DIR/ccd-state"
 
 # ---------- Helpers ----------
 need_root() {
@@ -144,6 +145,7 @@ load_env_defaults() {
   # Periodic metadata scanners
   OPENVPN_INDEX_FILE="${OPENVPN_INDEX_FILE:-/etc/openvpn/easy-rsa/pki/index.txt}"
   OPENVPN_CCD_DIR="${OPENVPN_CCD_DIR:-/etc/openvpn/ccd}"
+  CCD_STATE_DIR="${CCD_STATE_DIR:-$SPOOL_DIR/ccd-state}"
   INDEX_SCAN_INTERVAL_SECONDS="${INDEX_SCAN_INTERVAL_SECONDS:-60}"
   CCD_SCAN_INTERVAL_SECONDS="${CCD_SCAN_INTERVAL_SECONDS:-60}"
 }
@@ -167,6 +169,7 @@ TELEMETRY_URL="https://telemetry.your-domain.tld/api/v1/events"
 # Optional user and CCD scanners
 # OPENVPN_INDEX_FILE="/etc/openvpn/easy-rsa/pki/index.txt"
 # OPENVPN_CCD_DIR="/etc/openvpn/ccd"
+# CCD_STATE_DIR="/var/spool/openvpn-telemetry/ccd-state"
 # INDEX_SCAN_INTERVAL_SECONDS=60
 # CCD_SCAN_INTERVAL_SECONDS=60
 
@@ -232,6 +235,7 @@ MAX_PENDING_FILES=$MAX_PENDING_FILES
 
 OPENVPN_INDEX_FILE="$OPENVPN_INDEX_FILE"
 OPENVPN_CCD_DIR="$OPENVPN_CCD_DIR"
+CCD_STATE_DIR="$CCD_STATE_DIR"
 INDEX_SCAN_INTERVAL_SECONDS=$INDEX_SCAN_INTERVAL_SECONDS
 CCD_SCAN_INTERVAL_SECONDS=$CCD_SCAN_INTERVAL_SECONDS
 
@@ -241,6 +245,9 @@ MTLS_ENABLED=$MTLS_ENABLED
 CLIENT_CERT="$CLIENT_CERT"
 CLIENT_KEY="$CLIENT_KEY"
 CA_CERT="$CA_CERT"
+
+OPENVPN_SCRIPT_USER="$OPENVPN_SCRIPT_USER"
+OPENVPN_SCRIPT_GROUP="$OPENVPN_SCRIPT_GROUP"
 EOF
 
   chmod 0640 "$CONF_FILE"
@@ -250,12 +257,12 @@ EOF
 }
 
 setup_spool_permissions() {
-  mkdir -p "$SPOOL_DIR" "$PENDING_DIR"
+  mkdir -p "$SPOOL_DIR" "$PENDING_DIR" "$CCD_STATE_DIR"
   touch "$QUEUE_FILE" "$SEQ_FILE" "$LOCK_FILE" || true
 
   # Critical: hooks may run as nobody:nogroup.
   chown -R root:"$OPENVPN_SCRIPT_GROUP" "$SPOOL_DIR"
-  chmod 0770 "$SPOOL_DIR" "$PENDING_DIR"
+  chmod 2770 "$SPOOL_DIR" "$PENDING_DIR" "$CCD_STATE_DIR"
   chmod 0660 "$QUEUE_FILE" "$SEQ_FILE" "$LOCK_FILE" || true
 
   if [[ ! -s "$SEQ_FILE" ]]; then
@@ -278,6 +285,16 @@ source "$CONF"
 
 mkdir -p "$PENDING_DIR"
 touch "$QUEUE_FILE"
+mkdir -p "$CCD_STATE_DIR"
+
+ensure_queue_permissions() {
+  chmod 0660 "$QUEUE_FILE" 2>/dev/null || true
+  if [[ -n "${OPENVPN_SCRIPT_GROUP:-}" ]]; then
+    chgrp "$OPENVPN_SCRIPT_GROUP" "$QUEUE_FILE" 2>/dev/null || true
+  fi
+}
+
+ensure_queue_permissions
 
 log() { echo "$(date -u +"%Y-%m-%dT%H:%M:%SZ") openvpn-telemetry-agent: $*" >&2; }
 
@@ -322,7 +339,7 @@ rotate_queue_if_needed() {
       # atomic rename
       mv "$QUEUE_FILE" "$chunk" || return 0
       : > "$QUEUE_FILE"
-      chmod 0660 "$QUEUE_FILE" || true
+      ensure_queue_permissions
       log "Rotated queue -> $(basename "$chunk") (size=$size)"
     fi
     LAST_ROTATE="$now"
@@ -464,10 +481,10 @@ build_index_snapshots() {
   : >"$active_out"
   [[ -r "$OPENVPN_INDEX_FILE" ]] || return 1
 
-  awk -F '\t' -v valid_out="$valid_out" -v status_out="$status_out" '
+  awk -F '\t' -v valid_out="$valid_out" -v status_out="$status_out" -v active_out="$active_out" '
     {
       st = $1
-      exp = $2
+      exp_at = $2
       rev = $3
       dn = $NF
       sub(/^.*\/CN=/, "", dn)
@@ -476,7 +493,7 @@ build_index_snapshots() {
         next
       }
       status[cn] = st
-      expires[cn] = exp
+      expires[cn] = exp_at
       revoked[cn] = rev
     }
     END {
@@ -563,6 +580,47 @@ emit_ccd_info_event() {
   enqueue_json_line "$line"
 }
 
+file_hash() {
+  local path="$1"
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$path" | awk '{print $1}'
+    return 0
+  fi
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$path" | awk '{print $1}'
+    return 0
+  fi
+  cksum "$path" | awk '{print $1 ":" $2}'
+}
+
+ccd_state_file_for_cn() {
+  local cn="$1"
+  local key
+  key="$(printf '%s' "$cn" | tr -c 'A-Za-z0-9._-' '_')"
+  printf '%s/%s.hash' "$CCD_STATE_DIR" "$key"
+}
+
+ccd_should_emit() {
+  local cn="$1"
+  local ccd_file="$2"
+  local state_file old_hash new_hash
+
+  state_file="$(ccd_state_file_for_cn "$cn")"
+  new_hash="$(file_hash "$ccd_file")"
+  old_hash="$(cat "$state_file" 2>/dev/null || true)"
+
+  if [[ "$new_hash" == "$old_hash" ]]; then
+    return 1
+  fi
+
+  printf '%s\n' "$new_hash" >"$state_file"
+  chmod 0660 "$state_file" 2>/dev/null || true
+  if [[ -n "${OPENVPN_SCRIPT_GROUP:-}" ]]; then
+    chgrp "$OPENVPN_SCRIPT_GROUP" "$state_file" 2>/dev/null || true
+  fi
+  return 0
+}
+
 scan_ccd_and_emit_info() {
   local f cn
   [[ -d "$OPENVPN_CCD_DIR" ]] || return 0
@@ -572,7 +630,9 @@ scan_ccd_and_emit_info() {
     cn="$(basename "$f")"
     [[ -n "$cn" ]] || continue
     if awk -F '\t' -v k="$cn" '$1==k { found=1; exit } END { exit !found }' "$VALID_USERS_REF_FILE"; then
-      emit_ccd_info_event "$cn" "$f"
+      if ccd_should_emit "$cn" "$f"; then
+        emit_ccd_info_event "$cn" "$f"
+      fi
     fi
   done < <(find "$OPENVPN_CCD_DIR" -maxdepth 1 -type f | sort)
 }
@@ -744,6 +804,62 @@ patch_openvpn_conf_if_requested() {
   log "Patched OpenVPN config. Restart OpenVPN to apply."
 }
 
+is_already_installed() {
+  [[ -f "$SYSTEMD_UNIT" ]] || [[ -x "$AGENT_BIN" ]] || [[ -x "$WRITER_BIN" ]] || [[ -f "$CONNECT_HOOK" ]] || [[ -f "$DISCONNECT_HOOK" ]] || [[ -d "$CONF_DIR" ]] || [[ -d "$SPOOL_DIR" ]]
+}
+
+remove_hook_lines_from_conf() {
+  local conf="$1"
+  [[ -f "$conf" ]] || return 0
+
+  sed -i -E "\|^[[:space:]]*client-connect[[:space:]]+$CONNECT_HOOK[[:space:]]*$|d" "$conf" || true
+  sed -i -E "\|^[[:space:]]*client-disconnect[[:space:]]+$DISCONNECT_HOOK[[:space:]]*$|d" "$conf" || true
+}
+
+uninstall_telemetry() {
+  log "Uninstalling OpenVPN telemetry components..."
+
+  systemctl disable --now openvpn-telemetry-agent.service >/dev/null 2>&1 || true
+  rm -f "$SYSTEMD_UNIT"
+  systemctl daemon-reload || true
+
+  rm -f "$AGENT_BIN" "$WRITER_BIN"
+  rm -f "$CONNECT_HOOK" "$DISCONNECT_HOOK"
+  rm -rf "$CONF_DIR" "$SPOOL_DIR"
+
+  remove_hook_lines_from_conf "/etc/openvpn/server/server.conf"
+  remove_hook_lines_from_conf "/etc/openvpn/server.conf"
+  if [[ -n "${OPENVPN_SERVER_CONF:-}" ]]; then
+    remove_hook_lines_from_conf "$OPENVPN_SERVER_CONF"
+  fi
+
+  log "Uninstall complete."
+  log "Restart OpenVPN service if you removed client-connect/client-disconnect lines."
+}
+
+choose_install_action() {
+  local choice
+
+  if [[ ! -t 0 ]]; then
+    echo "reinstall"
+    return 0
+  fi
+
+  echo
+  echo "OpenVPN telemetry is already installed."
+  echo "Select action:"
+  echo "  1) Uninstall"
+  echo "  2) Reinstall"
+  echo "  3) Exit"
+  read -r -p "Enter choice [1-3]: " choice
+
+  case "$choice" in
+    1) echo "uninstall" ;;
+    2) echo "reinstall" ;;
+    *) echo "exit" ;;
+  esac
+}
+
 print_summary() {
   cat <<EOF
 
@@ -777,7 +893,26 @@ EOF
 }
 
 main() {
+  local action="install"
   need_root
+
+  if is_already_installed; then
+    action="$(choose_install_action)"
+    case "$action" in
+      uninstall)
+        uninstall_telemetry
+        exit 0
+        ;;
+      reinstall)
+        log "Reinstall selected."
+        ;;
+      *)
+        log "No action taken."
+        exit 0
+        ;;
+    esac
+  fi
+
   ensure_min_deps
   read_env_file_if_present
   detect_openvpn_script_user_group

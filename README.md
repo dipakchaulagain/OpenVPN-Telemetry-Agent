@@ -50,7 +50,7 @@ Your CentOS 7 profile is supported:
 
 - Hooks write NDJSON events to `queue.log`.
 - Agent periodically scans Easy-RSA index and emits `USERS_UPDATE` events.
-- Agent periodically scans CCD files and emits `CCD_INFO` events for valid users.
+- Agent scans CCD files for valid users and emits `CCD_INFO` only on first seen content and when content changes.
 - Agent rotates queue into chunks.
 - Agent posts batches to `TELEMETRY_URL` over HTTPS.
 - Chunks are deleted only after successful delivery.
@@ -76,6 +76,7 @@ TELEMETRY_URL="https://telemetry.example.com/api/v1/events"
 # Optional user and CCD scanners
 # OPENVPN_INDEX_FILE="/etc/openvpn/easy-rsa/pki/index.txt"
 # OPENVPN_CCD_DIR="/etc/openvpn/ccd"
+# CCD_STATE_DIR="/var/spool/openvpn-telemetry/ccd-state"
 # INDEX_SCAN_INTERVAL_SECONDS=60
 # CCD_SCAN_INTERVAL_SECONDS=60
 
@@ -106,6 +107,14 @@ Run:
 sudo bash OpenVPN-Telemetry-Agent-Installer.sh
 ```
 
+If already installed, installer shows a menu:
+
+- `1) Uninstall`
+- `2) Reinstall`
+- `3) Exit`
+
+If run non-interactively (no TTY), it defaults to `Reinstall`.
+
 Installer actions:
 
 - installs missing dependencies (`curl`, `util-linux` for `flock`)
@@ -114,6 +123,36 @@ Installer actions:
 - installs hooks
 - installs and starts systemd service
 - optionally patches OpenVPN config if `OPENVPN_SERVER_CONF` is set
+
+## Uninstall / Reinstall
+
+Run the same installer:
+
+```bash
+sudo bash OpenVPN-Telemetry-Agent-Installer.sh
+```
+
+When prompted:
+
+- Choose `1` to uninstall telemetry components
+- Choose `2` to reinstall
+- Choose `3` to exit without changes
+
+Uninstall removes:
+
+- `openvpn-telemetry-agent.service`
+- `/usr/local/sbin/openvpn-telemetry-agent`
+- `/usr/local/sbin/openvpn-telemetry-write-event`
+- `/etc/openvpn/scripts/telemetry-connect.sh`
+- `/etc/openvpn/scripts/telemetry-disconnect.sh`
+- `/etc/openvpn-telemetry/`
+- `/var/spool/openvpn-telemetry/`
+
+Uninstall also removes `client-connect` and `client-disconnect` telemetry lines from:
+
+- `/etc/openvpn/server/server.conf`
+- `/etc/openvpn/server.conf`
+- `OPENVPN_SERVER_CONF` (if set)
 
 ## OpenVPN Config
 
@@ -208,7 +247,7 @@ Event types emitted by this agent:
 - `SESSION_CONNECTED` from OpenVPN `client-connect` hook.
 - `SESSION_DISCONNECTED` from OpenVPN `client-disconnect` hook.
 - `USERS_UPDATE` from periodic Easy-RSA `index.txt` scans.
-- `CCD_INFO` from periodic CCD directory scans (for users currently valid in reference list).
+- `CCD_INFO` from CCD scans for users currently valid in reference list (first seen and then only when CCD file content changes).
 
 `USERS_UPDATE` example (periodic scan with newly added users, single bulk event):
 
