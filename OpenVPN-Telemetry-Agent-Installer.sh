@@ -426,19 +426,19 @@ emit_users_update_event() {
 
 emit_users_update_initial_bulk_event() {
   local users_file="$1"
-  local ts eid line users_json cn st exp first
+  local ts eid line users_json cn exp first
 
   ts="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
   eid="$(new_event_id)"
   users_json="["
   first=1
 
-  while IFS=$'\t' read -r cn st exp; do
+  while IFS=$'\t' read -r cn exp; do
     [[ -n "$cn" ]] || continue
     if (( first == 0 )); then
       users_json+=","
     fi
-    users_json+='{"common_name":"'"$(json_escape "$cn")"'","status":"'"$(json_escape "$st")"'","expires_at_index":"'"$(json_escape "$exp")"'"}'
+    users_json+='{"common_name":"'"$(json_escape "$cn")"'","status":"VALID","expires_at_index":"'"$(json_escape "$exp")"'"}'
     first=0
   done <"$users_file"
 
@@ -481,11 +481,14 @@ build_index_snapshots() {
   : >"$active_out"
   [[ -r "$OPENVPN_INDEX_FILE" ]] || return 1
 
-  awk -F '\t' -v valid_out="$valid_out" -v status_out="$status_out" -v active_out="$active_out" '
+  awk -v valid_out="$valid_out" -v status_out="$status_out" -v active_out="$active_out" '
     {
       st = $1
       exp_at = $2
-      rev = $3
+      rev = ""
+      if (st == "R" && NF >= 6) {
+        rev = $3
+      }
       dn = $NF
       sub(/^.*\/CN=/, "", dn)
       cn = dn
@@ -535,7 +538,9 @@ scan_index_and_emit_user_updates() {
   if [[ ! -f "$VALID_USERS_REF_FILE" ]]; then
     cp "$cur_valid" "$VALID_USERS_REF_FILE" 2>/dev/null || true
     emit_users_update_initial_bulk_event "$cur_valid"
+    NEXT_CCD_SCAN_EPOCH="$(( $(date +%s) + 60 ))"
     log "Users reference initialized from index file."
+    log "CCD scan delayed for 60 seconds after initial USERS_UPDATE."
     rm -f "$cur_valid" "$cur_status" "$cur_active" "$tmp_add" "$tmp_rem" "$prev_cn" "$cur_cn"
     return 0
   fi
@@ -640,13 +645,14 @@ scan_ccd_and_emit_info() {
 log "Started. url=$TELEMETRY_URL server_id=$SERVER_ID"
 LAST_INDEX_SCAN=0
 LAST_CCD_SCAN=0
+NEXT_CCD_SCAN_EPOCH=0
 while true; do
   now_epoch="$(date +%s)"
   if (( now_epoch - LAST_INDEX_SCAN >= INDEX_SCAN_INTERVAL_SECONDS )); then
     scan_index_and_emit_user_updates || true
     LAST_INDEX_SCAN="$now_epoch"
   fi
-  if (( now_epoch - LAST_CCD_SCAN >= CCD_SCAN_INTERVAL_SECONDS )); then
+  if (( now_epoch >= NEXT_CCD_SCAN_EPOCH )) && (( now_epoch - LAST_CCD_SCAN >= CCD_SCAN_INTERVAL_SECONDS )); then
     scan_ccd_and_emit_info || true
     LAST_CCD_SCAN="$now_epoch"
   fi
@@ -845,12 +851,12 @@ choose_install_action() {
     return 0
   fi
 
-  echo
-  echo "OpenVPN telemetry is already installed."
-  echo "Select action:"
-  echo "  1) Uninstall"
-  echo "  2) Reinstall"
-  echo "  3) Exit"
+  echo >&2
+  echo "OpenVPN telemetry is already installed." >&2
+  echo "Select action:" >&2
+  echo "  1) Uninstall" >&2
+  echo "  2) Reinstall" >&2
+  echo "  3) Exit" >&2
   read -r -p "Enter choice [1-3]: " choice
 
   case "$choice" in
